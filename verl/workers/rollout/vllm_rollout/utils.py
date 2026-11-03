@@ -344,9 +344,9 @@ class vLLMColocateWorkerExtension:
             self.remove_lora(VLLM_LORA_INT_ID)
             logger.info("LoRA adapter sync: remove old lora and prepare new lora")
         elif is_quantized_model(self.model_runner.vllm_config):
-            quant_reload_states = [
-                (model, prepare_quanted_weights_for_loading(model)) for model in self._iter_all_models()
-            ]
+            quant_reload_states = {
+                model: prepare_quanted_weights_for_loading(model) for model in self._iter_all_models()
+            }
         else:
             # TODO(wuxibin): not need anymore for newer vllm version.
             for model in self._iter_all_models():
@@ -420,6 +420,7 @@ class vLLMColocateWorkerExtension:
                 weights,
                 peft_config=peft_config,
                 base_sync_done=base_sync_done,
+                quant_reload_states=quant_reload_states,
             )
 
         with mtp_load_context():
@@ -433,8 +434,14 @@ class vLLMColocateWorkerExtension:
                 processed,
             )
         elif is_quantized_model(self.model_runner.vllm_config):
-            for model, reload_state in quant_reload_states:
+            for model, reload_state in quant_reload_states.items():
                 process_quanted_weights_after_loading(model, reload_state)
+            if peft_config is not None:
+                from verl.utils.vllm.vllm_quant_utils import validate_fp8_weight_pairs
+
+                # Restore every model's live storage before reporting an incomplete refit.
+                for reload_state in quant_reload_states.values():
+                    validate_fp8_weight_pairs(reload_state.get("pending_fp8", {}))
         else:
             # Some post-load transforms are non-idempotent; run once after all buckets.
             from vllm.model_executor.model_loader.utils import process_weights_after_loading
@@ -466,6 +473,7 @@ class vLLMColocateWorkerExtension:
         weights: list[tuple[str, torch.Tensor]],
         peft_config: dict,
         base_sync_done: bool,
+        quant_reload_states=None,
     ):
         if peft_config and base_sync_done:
             # The caller already copied these out of the receiver's reused IPC bucket buffer (#6454).
@@ -488,13 +496,24 @@ class vLLMColocateWorkerExtension:
                 # Convert bf16 weights to fp8 format before loading
                 model_updates = drop_tied_alias_updates(self.model_runner.model, param_updates)
                 loaded_params = (
-                    load_quanted_weights(model_updates, self.model_runner, peft_config=peft_config)
+                    load_quanted_weights(
+                        model_updates,
+                        self.model_runner,
+                        peft_config=peft_config,
+                        reload_states=quant_reload_states,
+                    )
                     if model_updates
                     else []
                 )
                 # Keep the draft model in sync when present.
                 if self._use_mtp_drafter_weight_sync() and model_updates:
-                    load_quanted_weights(model_updates, self.model_runner, is_drafter=True, peft_config=peft_config)
+                    load_quanted_weights(
+                        model_updates,
+                        self.model_runner,
+                        is_drafter=True,
+                        peft_config=peft_config,
+                        reload_states=quant_reload_states,
+                    )
                 loaded_buffers = self._apply_buffer_updates_all_models(buffer_updates, named_buffers)
                 logger.info(
                     f"FP8 weights loaded (async), loaded_params: {len(loaded_params)}, loaded_buffers: {loaded_buffers}"
